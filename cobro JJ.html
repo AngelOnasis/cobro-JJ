@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistema de Cobro Simple</title>
+    <!-- Incluye Tailwind CSS para estilos rápidos y responsivos -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, onSnapshot, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment or defaults for local testing
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let firebaseConfig = {}; // Inicializar como objeto vacío
+
+        // === START: Configuración de Firebase para PRUEBAS LOCALES ===
+        // Esta sección ha sido DESCOMENTADA y configurada con tus credenciales.
+        // Si estás ejecutando esto FUERA del entorno de Canvas, estas serán tus credenciales.
+        // Si estás en Canvas, la configuración de Canvas tendrá prioridad.
+        firebaseConfig = {
+            apiKey: "AIzaSyABdjL24YsSXpybkv6CcGly-GuA4z7v7aQ",
+            authDomain: "cosbro-bolnos.firebaseapp.com",
+            projectId: "cosbro-bolnos",
+            storageBucket: "cosbro-bolnos.firebasestorage.app",
+            messagingSenderId: "727794983770",
+            appId: "1:727794983770:web:db72b6d3ac7c787880c963"
+            // measurementId no es necesario para Firestore/Auth, así que lo omitimos aquí para esta app.
+        };
+        // === END: Configuración de Firebase para PRUEBAS LOCALES ===
+
+
+        // Si se está ejecutando en el entorno de Canvas, __firebase_config se definirá y tendrá prioridad.
+        // Esto sobrescribe cualquier configuración local que se haya puesto arriba si estás en Canvas.
+        if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+            try {
+                const canvasConfig = JSON.parse(__firebase_config);
+                // Fusionar o sobrescribir con la configuración de Canvas si está disponible
+                firebaseConfig = { ...firebaseConfig, ...canvasConfig };
+            } catch (e) {
+                console.error("Error al parsear __firebase_config:", e);
+                displayMessage('Error: La configuración de Firebase proporcionada por el entorno es inválida.', 'error', appMessage);
+            }
+        }
+
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app;
+        let db;
+        let auth;
+        let userId = 'anonimo'; // Valor predeterminado hasta que se autentique
+        let products = []; // Mover products aquí para que sea global y accesible
+
+        // Elementos del DOM para la sección de Venta
+        const productCodeInput = document.getElementById('productCodeInput');
+        const currentItemDisplay = document.getElementById('currentItemDisplay');
+        const cartItemsList = document.getElementById('cartItems');
+        const totalCostDisplay = document.getElementById('totalCost');
+        const clearSaleButton = document.getElementById('clearSaleButton');
+        const finishSaleButton = document.getElementById('finishSaleButton');
+        const appMessage = document.getElementById('appMessage');
+        const emptyCartMessage = document.getElementById('emptyCartMessage');
+        const currentUserIdDisplay = document.getElementById('currentUserId');
+
+
+        // Elementos del DOM para la sección de Administración de Productos
+        const newProductCodeInput = document.getElementById('newProductCodeInput');
+        const newProductNameInput = document.getElementById('newProductNameInput');
+        const newProductPriceInput = document.getElementById('newProductPriceInput');
+        const addProductButton = document.getElementById('addProductButton');
+        const adminMessage = document.getElementById('adminMessageDisplay'); // Ahora se obtiene por ID
+
+
+        // Carrito de compras
+        let cart = [];
+        let total = 0;
+
+        // Función para mostrar mensajes temporales al usuario
+        function displayMessage(message, type = 'info', targetElement = appMessage) {
+            targetElement.textContent = message;
+            targetElement.classList.remove('hidden', 'error', 'success', 'info'); // Limpiar clases anteriores
+            if (type === 'error') {
+                targetElement.classList.add('error');
+            } else if (type === 'success') {
+                targetElement.classList.add('success');
+            } else { // 'info' por defecto o 'loading'
+                targetElement.classList.add('info');
+            }
+            // Mostrar el elemento (si estaba oculto)
+            targetElement.classList.remove('hidden');
+
+            // Ocultar el mensaje después de 3 segundos (excepto si es un mensaje de carga persistente)
+            // Un mensaje de 'info' con 'Cargando productos...' no se ocultará automáticamente
+            if (type !== 'info' || !message.includes('Cargando')) {
+                setTimeout(() => {
+                    targetElement.classList.add('hidden');
+                }, 3000);
+            }
+            console.log(`[${type.toUpperCase()} - ${targetElement.id}]: ${message}`); // Para depuración en la consola
+        }
+
+        // Función para buscar un producto por su código en el array local (sincronizado con Firestore)
+        function findProduct(code) {
+            return products.find(product => product.code === code);
+        }
+
+        // Función para agregar un producto al carrito
+        function addItemToCart(product) {
+            cart.push(product); // Agrega el producto al array del carrito
+            updateCartUI();    // Actualiza la interfaz del carrito
+            updateTotal();     // Recalcula y muestra el total
+            displayMessage(`"${product.name}" agregado.`, 'success', appMessage);
+        }
+
+        // Función para actualizar la lista de artículos en la interfaz
+        function updateCartUI() {
+            cartItemsList.innerHTML = ''; // Limpia la lista actual
+            if (cart.length === 0) {
+                emptyCartMessage.classList.remove('hidden'); // Mostrar mensaje de carrito vacío
+                return;
+            } else {
+                emptyCartMessage.classList.add('hidden'); // Ocultar mensaje de carrito vacío
+            }
+
+            cart.forEach(item => {
+                const itemDiv = document.createElement('div');
+                itemDiv.classList.add('item-row');
+                itemDiv.innerHTML = `
+                    <span class="text-gray-700">${item.name}</span>
+                    <span class="text-gray-900 font-medium">RD$ ${item.price.toFixed(2)}</span>
+                `;
+                cartItemsList.appendChild(itemDiv);
+            });
+            // Asegurarse de que el scroll se vaya al final si se añaden muchos ítems
+            cartItemsList.scrollTop = cartItemsList.scrollHeight;
+        }
+
+        // Función para calcular y mostrar el total
+        function updateTotal() {
+            total = cart.reduce((sum, item) => sum + item.price, 0);
+            totalCostDisplay.textContent = `RD$ ${total.toFixed(2)}`;
+        }
+
+        // Función para limpiar toda la venta
+        function clearSale() {
+            cart = [];       // Vacía el carrito
+            total = 0;       // Reinicia el total
+            updateCartUI();  // Actualiza la interfaz del carrito (mostrando vacío)
+            updateTotal();   // Actualiza el total a 0.00
+            productCodeInput.value = ''; // Limpia el campo de entrada
+            currentItemDisplay.textContent = ''; // Limpia la visualización del ítem actual
+            displayMessage('Venta limpiada.', 'info', appMessage);
+        }
+
+        // Evento al presionar una tecla en el campo de código de venta
+        productCodeInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                const code = productCodeInput.value.trim();
+                if (code) {
+                    const product = findProduct(code);
+                    if (product) {
+                        addItemToCart(product);
+                        currentItemDisplay.textContent = `${product.name} - RD$ ${product.price.toFixed(2)}`;
+                    } else {
+                        displayMessage('Producto no encontrado.', 'error', appMessage);
+                        currentItemDisplay.textContent = 'Código no válido.';
+                    }
+                    productCodeInput.value = ''; // Limpiar el input después de procesar
+                    productCodeInput.focus();    // Mantener el foco en el input
+                }
+            }
+        });
+
+        // Evento para el botón "Limpiar Venta"
+        clearSaleButton.addEventListener('click', clearSale);
+
+        // Evento para el botón "Finalizar Venta" (puedes expandir esta funcionalidad)
+        finishSaleButton.addEventListener('click', () => {
+            if (cart.length > 0) {
+                displayMessage(`Venta finalizada por un total de RD$ ${total.toFixed(2)}.`, 'success', appMessage);
+                // Aquí podrías agregar lógica para guardar la venta, imprimir un recibo, etc.
+                clearSale(); // Opcional: limpiar la venta después de finalizar
+            } else {
+                displayMessage('No hay artículos en el carrito para finalizar la venta.', 'error', appMessage);
+            }
+        });
+
+        // --- Lógica para la Administración de Productos ---
+        addProductButton.addEventListener('click', async () => {
+            const code = newProductCodeInput.value.trim();
+            const name = newProductNameInput.value.trim();
+            const price = parseFloat(newProductPriceInput.value.trim());
+
+            if (!code || !name || isNaN(price) || price <= 0) {
+                displayMessage('Por favor, ingresa un código, nombre y un precio válido (mayor que 0).', 'error', adminMessage);
+                return;
+            }
+
+            // Verificar si el código ya existe localmente (sincronizado con Firestore)
+            if (findProduct(code)) {
+                displayMessage(`El producto con el código "${code}" ya existe.`, 'error', adminMessage);
+                return;
+            }
+
+            const newProduct = { code, name, price };
+            
+            try {
+                displayMessage('Agregando producto...', 'info', adminMessage); // Usar 'info' para carga
+                // Guardar el nuevo producto en Firestore
+                await addDoc(collection(db, `artifacts/${appId}/public/data/products`), newProduct);
+                displayMessage(`Producto "${name}" (Código: ${code}, Precio: RD$ ${price.toFixed(2)}) agregado exitosamente.`, 'success', adminMessage);
+
+                // Limpiar los campos del formulario de administración
+                newProductCodeInput.value = '';
+                newProductNameInput.value = '';
+                newProductPriceInput.value = '';
+                newProductCodeInput.focus(); // Mantener el foco
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                displayMessage('Error al agregar el producto. Inténtalo de nuevo.', 'error', adminMessage);
+            }
+        });
+
+        // --- Inicialización de Firebase y carga de productos ---
+        async function initializeFirebaseAndLoadProducts() {
+            try {
+                console.log("Firebase Config:", firebaseConfig); // Log the config for debugging
+                console.log("Initial Auth Token:", initialAuthToken); // Log the token
+
+                // IMPORTANTE: Verificar si firebaseConfig tiene la información mínima para inicializar
+                if (!firebaseConfig || Object.keys(firebaseConfig).length === 0 || !firebaseConfig.projectId || !firebaseConfig.apiKey) {
+                    console.error("Firebase config is incomplete or invalid. Cannot initialize Firebase.");
+                    displayMessage('Error: La configuración de Firebase es incompleta o inválida. Asegúrate de que tu proyecto de Firebase esté configurado correctamente.', 'error', appMessage);
+                    return; // Detener la inicialización si la configuración es mala
+                }
+
+                // Inicializar la aplicación Firebase
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Autenticar usuario
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Obtener ID de usuario actual y escucharlo
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        currentUserIdDisplay.textContent = `ID de Usuario: ${userId}`;
+                        console.log("Autenticado con ID de usuario:", userId);
+                    } else {
+                        userId = 'anonimo';
+                        currentUserIdDisplay.textContent = `ID de Usuario: ${userId} (No autenticado)`;
+                        console.log("Ningún usuario ha iniciado sesión o la autenticación falló.");
+                    }
+                });
+
+                displayMessage('Cargando productos...', 'info', appMessage); // Usar 'info' para carga
+
+                // Escuchar cambios en la colección de productos en tiempo real
+                const productsCollectionRef = collection(db, `artifacts/${appId}/public/data/products`);
+                const q = query(productsCollectionRef);
+
+                onSnapshot(q, (snapshot) => {
+                    products = []; // Limpiar la lista actual antes de recargar
+                    snapshot.forEach((doc) => {
+                        products.push({ id: doc.id, ...doc.data() });
+                    });
+                    console.log("Productos cargados/actualizados:", products);
+                    displayMessage('Productos cargados exitosamente.', 'success', appMessage);
+                }, (error) => {
+                    console.error("Error al obtener productos:", error);
+                    displayMessage('Error al cargar productos. Por favor, recarga la página.', 'error', appMessage);
+                });
+
+            } catch (e) {
+                console.error("Error crítico al iniciar Firebase o cargar productos:", e);
+                displayMessage('Error crítico al iniciar la aplicación. Consulta la consola del navegador para más detalles.', 'error', appMessage);
+            }
+        }
+
+        // Inicializar la interfaz al cargar la página
+        window.onload = () => {
+            initializeFirebaseAndLoadProducts();
+            updateCartUI(); // Carga la UI del carrito (estará vacía al inicio)
+            updateTotal();  // Actualiza el total (estará en 0.00 al inicio)
+        };
+
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6; /* Fondo gris claro */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 1rem; /* Padding para el cuerpo en pantallas pequeñas */
+        }
+        .container {
+            max-width: 95%; /* Aumento del ancho máximo para el contenedor principal */
+            width: 700px; /* Ancho fijo ajustado para el contenedor en pantallas grandes */
+            background-color: #ffffff; /* Fondo blanco para la tarjeta */
+            border-radius: 1.5rem; /* Bordes más redondeados */
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04); /* Sombra más pronunciada */
+            padding: 2rem; /* Espaciado interno */
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem; /* Espacio entre secciones */
+        }
+        input[type="text"], input[type="number"] {
+            padding: 0.75rem 1rem;
+            border: 1px solid #d1d5db; /* Borde gris */
+            border-radius: 0.5rem; /* Bordes redondeados */
+            font-size: 1rem;
+            width: 100%;
+            outline: none;
+            transition: border-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+        }
+        input[type="text"]:focus, input[type="number"]:focus {
+            border-color: #3b82f6; /* Borde azul al enfocar */
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); /* Sombra azul al enfocar */
+        }
+        button {
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out, transform 0.1s ease-in-out;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        button.primary {
+            background-color: #3b82f6; /* Azul primario */
+            color: #ffffff;
+        }
+        button.primary:hover {
+            background-color: #2563eb; /* Azul más oscuro al pasar el ratón */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        button.secondary {
+            background-color: #ef4444; /* Rojo para borrar */
+            color: #ffffff;
+        }
+        button.secondary:hover {
+            background-color: #dc2626; /* Rojo más oscuro al pasar el ratón */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        button.success { /* Nuevo estilo para el botón de añadir producto */
+            background-color: #10b981; /* Verde */
+            color: #ffffff;
+        }
+        button.success:hover {
+            background-color: #059669; /* Verde más oscuro */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        button:active {
+            transform: translateY(1px); /* Efecto de click */
+        }
+        .item-list {
+            max-height: 250px; /* Altura máxima para la lista de artículos */
+            overflow-y: auto; /* Scroll si hay muchos artículos */
+            border: 1px solid #e5e7eb; /* Borde para la lista */
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            background-color: #f9fafb; /* Fondo ligeramente gris para la lista */
+        }
+        .item-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0.25rem;
+            border-bottom: 1px dashed #e5e7eb; /* Borde punteado entre artículos */
+        }
+        .item-row:last-child {
+            border-bottom: none; /* Sin borde en el último artículo */
+        }
+        .message {
+            padding: 0.75rem;
+            border-radius: 0.5rem;
+            margin-top: 1rem;
+            text-align: center;
+            font-weight: 600;
+        }
+        .message.error {
+            background-color: #fee2e2; /* Rojo claro */
+            color: #ef4444; /* Rojo oscuro */
+        }
+        .message.success {
+            background-color: #d1fae5; /* Verde claro */
+            color: #10b981; /* Verde oscuro */
+        }
+        .message.info { /* Mensaje informativo */
+            background-color: #bfdbfe; /* Azul claro */
+            color: #1d4ed8; /* Azul oscuro */
+        }
+        .total-display {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 0;
+            border-top: 2px solid #e5e7eb; /* Borde superior más grueso para el total */
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+        .product-admin-section {
+            border-top: 1px solid #e5e7eb;
+            padding-top: 1.5rem;
+            margin-top: 1.5rem;
+        }
+        .form-group {
+            margin-bottom: 0.75rem;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 0.25rem;
+            font-weight: 600;
+            color: #4b5563;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-4">Sistema de Cobro</h1>
+
+        <!-- Identificador de Usuario para Firestore -->
+        <p id="currentUserId" class="text-sm text-gray-600 text-center mb-4">ID de Usuario: Cargando...</p>
+
+        <!-- Campo para introducir el código del producto para la venta -->
+        <div>
+            <label for="productCodeInput" class="block text-gray-700 text-sm font-semibold mb-2">
+                Ingresa el Código del Artículo para la Venta:
+            </label>
+            <input type="text" id="productCodeInput" placeholder="Ej. 101, 203..." class="w-full rounded-lg">
+        </div>
+
+        <!-- Mensajes de la aplicación -->
+        <div id="appMessage" class="hidden message"></div>
+
+        <!-- Artículo actual encontrado (opcional, para feedback inmediato) -->
+        <div id="currentItemDisplay" class="text-center text-lg text-gray-600"></div>
+
+        <!-- Lista de artículos agregados a la venta -->
+        <div>
+            <h2 class="text-xl font-semibold text-gray-800 mb-2">Artículos en el Carrito:</h2>
+            <div id="cartItems" class="item-list">
+                <!-- Los artículos se agregarán aquí dinámicamente -->
+                <p class="text-gray-500 text-center py-4" id="emptyCartMessage">No hay artículos en el carrito.</p>
+            </div>
+        </div>
+
+        <!-- Total de la compra -->
+        <div class="total-display">
+            <span>Total:</span>
+            <span id="totalCost">RD$ 0.00</span>
+        </div>
+
+        <!-- Botones de acción de la venta -->
+        <div class="flex justify-between gap-4 mb-8">
+            <button id="clearSaleButton" class="secondary flex-1 rounded-lg">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm6 0a1 1 0 11-2 0v6a1 1 0 112 0V8z" clip-rule="evenodd" />
+                </svg>
+                Limpiar Venta
+            </button>
+            <button id="finishSaleButton" class="primary flex-1 rounded-lg">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M4 4a2 2 0 00-2 2v6a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2H4zm12 10H4v2h12v-2zM4 6h12v2H4V6z" />
+                </svg>
+                Finalizar Venta
+            </button>
+        </div>
+
+        <!-- Sección de Administración de Productos -->
+        <div class="product-admin-section">
+            <h2 class="text-2xl font-bold text-center text-gray-800 mb-4">Administrar Productos</h2>
+
+            <div class="form-group">
+                <label for="newProductCodeInput">Código del Artículo:</label>
+                <input type="text" id="newProductCodeInput" placeholder="Ej. 401" class="w-full rounded-lg">
+            </div>
+            <div class="form-group">
+                <label for="newProductNameInput">Nombre del Artículo:</label>
+                <input type="text" id="newProductNameInput" placeholder="Ej. Cuaderno Anillado" class="w-full rounded-lg">
+            </div>
+            <div class="form-group">
+                <label for="newProductPriceInput">Costo del Artículo (RD$):</label>
+                <input type="number" id="newProductPriceInput" placeholder="Ej. 250.75" step="0.01" class="w-full rounded-lg">
+            </div>
+            <!-- Elemento para el mensaje de administración -->
+            <div id="adminMessageDisplay" class="hidden message"></div>
+            <button id="addProductButton" class="success w-full mt-4 rounded-lg">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M10 5a1 1 0 011 1v3h3a1 1 0 110 2h-3v3a1 1 0 11-2 0v-3H6a1 1 0 110-2h3V6a1 1 0 011-1z" clip-rule="evenodd" />
+                </svg>
+                Agregar Nuevo Producto
+            </button>
+        </div>
+
+    </div>
+</body>
+</html>
